@@ -138,17 +138,25 @@ public struct DimensionSchema: Sendable, Equatable {
         for key in declaredKeys {
             switch domains[key] {
             case .closed(let allowed):
-                // +1 for `__invalid__`.
-                product = product.saturatingMultiplied(by: allowed.count.saturatingAdding(1))
+                // +2: `__invalid__` for a value outside the set, and `__unset__` for a
+                // caller who omits the key entirely. Omission is not the same event as a
+                // bad value and it produces its own series, so it has to be counted.
+                product = product.saturatingMultiplied(by: allowed.count.saturatingAdding(2))
             case .open:
-                // +2 for `__other__` and `__unset__`.
+                // +3: `__other__`, `__unset__`, and `__invalid__`. An open key still yields
+                // `__invalid__` when a caller forges a reserved sentinel — that check runs
+                // before the domain switch in `admit(_:)`, so it applies to every domain.
+                // Omitting it here would make a type named `…UpperBound` not an upper bound.
                 let allocated = openAllocation[key] ?? 0
-                product = product.saturatingMultiplied(by: allocated.saturatingAdding(2))
+                product = product.saturatingMultiplied(by: allocated.saturatingAdding(3))
             case .none:
                 continue
             }
         }
-        return product
+        // +1 for the all-`__overflow__` set, which is not a member of any key's domain
+        // — it replaces the whole label set rather than any individual value, so the
+        // per-key product cannot reach it.
+        return product.saturatingAdding(1)
     }
 }
 
