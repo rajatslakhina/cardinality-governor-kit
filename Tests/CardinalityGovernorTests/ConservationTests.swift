@@ -90,7 +90,10 @@ final class ConservationTests: XCTestCase {
         // 4 slots, 40 distinct values, 10 observations each.
         for round in 0..<10 {
             for value in 0..<40 {
-                governor.admit(LabelSet([locale: "loc-\(value)-\(round % 1)"]))
+                // `round` deliberately does not vary the value: the point is 40 distinct values
+                // observed 10 times each, not 400 distinct values observed once.
+                _ = round
+                governor.admit(LabelSet([locale: "loc-\(value)"]))
             }
         }
 

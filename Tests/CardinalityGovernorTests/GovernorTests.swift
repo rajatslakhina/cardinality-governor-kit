@@ -120,9 +120,14 @@ final class GovernorTests: XCTestCase {
 
         let snapshot = governor.snapshot
         XCTAssertLessThanOrEqual(snapshot.trackedSeries, 100)
-        XCTAssertGreaterThan(
-            snapshot.jointSpaceUpperBound, 1_000,
-            "the joint space should be far larger than the joint budget — that is the point"
+        // Exact, not `> 1_000`. A loose lower bound passes against an off-by-one in the
+        // per-key factor, which is how the original undercount survived: four open keys at
+        // 8 allocated slots each is 8 real values plus `__other__`, `__unset__` and
+        // `__invalid__` — 11 per key, 11⁴ = 14_641 — plus one for the all-`__overflow__`
+        // set, which belongs to no key's domain. The joint budget is 100.
+        XCTAssertEqual(
+            snapshot.jointSpaceUpperBound, 14_642,
+            "the joint space is two orders of magnitude past the joint budget — that is the point"
         )
         XCTAssertGreaterThan(snapshot.jointOverflowObservations, 0)
         XCTAssertEqual(snapshot.conservation, .conserved(total: 20_000))

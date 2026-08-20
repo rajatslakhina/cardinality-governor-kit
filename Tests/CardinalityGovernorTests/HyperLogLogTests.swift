@@ -70,8 +70,13 @@ final class HyperLogLogTests: XCTestCase {
         // underflows towards zero and the raw estimate races towards infinity. `Int(raw)`
         // would trap; the saturating conversion must not.
         let estimator = HyperLogLog(precision: 10, registers: [UInt8](repeating: 255, count: 1024))
+        // Not `>= 0`: `estimatedCardinality` clamps at zero on every path, so that
+        // assertion cannot fail. The all-255 bank has a determinate answer — the raw
+        // estimate is 0.7213 × 2^20 / (1024 × 2^-255) ≈ 4.3e79, far past `Int.max` — so the
+        // saturating conversion is observable, and a non-saturating `Int(raw)` would trap
+        // here instead.
         let estimate = estimator.estimatedCardinality
-        XCTAssertGreaterThanOrEqual(estimate, 0)
+        XCTAssertEqual(estimate, .max)
         XCTAssertGreaterThanOrEqual(estimator.estimateInterval.upperBound, estimator.estimateInterval.lowerBound)
     }
 

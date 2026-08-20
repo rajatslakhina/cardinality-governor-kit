@@ -106,7 +106,13 @@ final class FingerprintTests: XCTestCase {
             _ = catalog.register(LabelSet([locale: "value-\(index)"]), hasher: hasher)
         }
         XCTAssertGreaterThan(catalog.unresolvedCollisions, 0)
-        XCTAssertLessThanOrEqual(catalog.count, 512)
+        // Not `<= 512`: 512 is the capacity that was passed in, so that assertion is
+        // structurally unfalsifiable. Under a hasher that always collides, the reachable
+        // maximum is one slot per probe plus the original.
+        XCTAssertLessThanOrEqual(
+            catalog.count, FingerprintCatalog.maximumProbes + 1,
+            "every registration collides, so only the probe sequence can create entries"
+        )
     }
 
     func testRegisteringTheSameLabelsTwiceIsIdempotent() {
