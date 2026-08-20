@@ -115,13 +115,39 @@ struct SpaceSavingSketch: Sendable {
         siftDown(from: 0)
     }
 
+    /// Re-caps the sketch, preserving the strongest counters.
+    ///
+    /// Growing keeps every counter and simply raises the ceiling. Shrinking keeps the top
+    /// `capacity` by count and discards the rest — which loses information, but losing the
+    /// *weakest* counters is the same thing `observe(_:)` already does under pressure, so
+    /// it introduces no bias the structure did not already have.
+    ///
+    /// `totalObservations` is deliberately preserved across a resize: it is a lifetime
+    /// count of everything this sketch has seen, monitored or not, and a resize is a
+    /// capacity change rather than a new sketch.
+    mutating func resize(capacity newCapacity: Int) {
+        let clamped = min(max(newCapacity, Self.capacityRange.lowerBound), Self.capacityRange.upperBound)
+        guard clamped != capacity else { return }
+        capacity = clamped
+
+        guard heap.count > clamped else { return }
+        // `ranked()` returns strongest-first, so a prefix is the top-k.
+        let kept = Array(ranked().prefix(clamped))
+        heap = kept
+        index = [:]
+        for (position, counter) in kept.enumerated() { index[counter.value] = position }
+        rebuildHeap()
+    }
+
     /// Resets counts while keeping the monitored set, so a value that was frequent last
     /// window starts the next one as an incumbent rather than as a stranger.
     ///
     /// Counts decay rather than zero: halving preserves the *relative* ordering that the
-    /// promotion rule reads, while letting a value that stops appearing fall out within a
-    /// few windows. Zeroing would make every window a fresh arrival-order race — the exact
-    /// failure this sketch exists to avoid.
+    /// promotion rule reads. Note it does **not** make a value fall out on its own —
+    /// counts floor at 1 and no counter is ever removed — so this is not, and must not be
+    /// mistaken for, evidence of liveness. `SurvivorSet` tracks that separately, from live
+    /// observation. Zeroing instead of halving would make every window a fresh
+    /// arrival-order race, which is the exact failure this sketch exists to avoid.
     mutating func decay() {
         for position in heap.indices {
             // `max(0, …) / 2` cannot trap: the dividend is non-negative and the divisor is
