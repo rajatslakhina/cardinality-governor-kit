@@ -44,7 +44,7 @@ public struct Scenario: Identifiable, Sendable {
 @Observable
 public final class GovernorDashboardModel {
 
-    public let scenarios: [Scenario]
+    public private(set) var scenarios: [Scenario]
     public private(set) var selectedID: String
     public private(set) var snapshot: GovernorSnapshot
     public private(set) var lastWindow: WindowReport?
@@ -84,11 +84,18 @@ public final class GovernorDashboardModel {
         self.governor = initialGovernor
         self.lastWindow = nil
         self.snapshot = initialGovernor.snapshot
+    }
 
-        // Warm up so the dashboard is populated the instant it appears. An empty
-        // dashboard on launch reads as a broken demo, and the interesting behaviour —
-        // survivors settling, the tail collapsing — needs a few windows to show up.
-        warmUp()
+    /// Loads the scenarios and warms the first one up.
+    ///
+    /// Separate from `init` and idempotent, because the warm-up is ~1,600 synchronous
+    /// admissions and SwiftUI may re-initialise a view struct many times. Called from
+    /// `.task`, so it runs once when the view appears rather than once per re-render.
+    public func load(scenarios newScenarios: [Scenario]) {
+        guard self.scenarios.isEmpty, !newScenarios.isEmpty else { return }
+        self.scenarios = newScenarios
+        selectedID = newScenarios[0].id
+        reset()
     }
 
     public func select(_ id: String) {
@@ -148,23 +155,39 @@ public struct GovernorDashboardView: View {
 
     @State private var model: GovernorDashboardModel
 
+    private let scenarios: [Scenario]
+
     public init(scenarios: [Scenario]) {
-        _model = State(initialValue: GovernorDashboardModel(scenarios: scenarios))
+        self.scenarios = scenarios
+        // `State(initialValue:)` takes a value, not an autoclosure, so anything expensive
+        // here runs on the main thread every time SwiftUI re-initialises the view struct —
+        // with all but the first result discarded. The model is therefore constructed
+        // empty and populated from `.task`. In an app whose subject is launch-time
+        // telemetry, doing 1,600 synchronous admissions inside `init` would be a poor
+        // advertisement.
+        _model = State(initialValue: GovernorDashboardModel(scenarios: []))
     }
 
     public var body: some View {
         NavigationStack {
             Group {
                 if model.scenarios.isEmpty {
+                    // Also the state during the first frame, before `.task` runs — which
+                    // is correct: a placeholder for one frame beats blocking the launch.
                     ContentUnavailableView(
-                        "No scenarios",
+                        scenarios.isEmpty ? "No scenarios" : "Warming up…",
                         systemImage: "chart.bar.doc.horizontal",
-                        description: Text("The host app supplied an empty scenario catalog.")
+                        description: Text(
+                            scenarios.isEmpty
+                                ? "The host app supplied an empty scenario catalog."
+                                : "Priming the governor with a few windows of traffic."
+                        )
                     )
                 } else {
                     dashboard
                 }
             }
+            .task { model.load(scenarios: scenarios) }
             .navigationTitle("Cardinality Governor")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
@@ -224,7 +247,10 @@ public struct GovernorDashboardView: View {
                 }
             }
             LabeledContent("Observations admitted", value: model.snapshot.totalAdmitted.formatted())
-            LabeledContent("Observations dropped", value: "0")
+            // Derived, not hardcoded. A literal "0" six lines above a footer promising
+            // every number is recomputed from live tallies would be the one place in the
+            // app where the claim is false — and it is the panel a reviewer reads first.
+            LabeledContent("Observations dropped", value: finding.shortfall.formatted())
         } header: {
             Text("Conservation ledger")
         } footer: {
@@ -372,13 +398,13 @@ public struct GovernorDashboardView: View {
         }
     }
 
-    /// `ProgressView` traps on a non-finite or negative fraction, and `total` here is
-    /// derived from a budget that a host app could configure to zero — hence the clamps.
+    /// The clamp lives in `SafeProgress`, in the core module, so that it has a test that
+    /// runs everywhere rather than only on platforms that have SwiftUI. See
+    /// `WindowSemanticsTests.testSafeProgressNeverProducesAValueProgressViewWouldTrapOn`.
     private func budgetBar(value: Double, total: Double) -> some View {
-        let safeTotal = total.isFinite && total > 0 ? total : 1
-        let safeValue = value.isFinite ? min(max(value, 0), safeTotal) : 0
-        return ProgressView(value: safeValue, total: safeTotal)
-            .tint(safeValue >= safeTotal ? Color.orange : Color.accentColor)
+        let safe = SafeProgress.clamped(value: value, total: total)
+        return ProgressView(value: safe.value, total: safe.total)
+            .tint(safe.value >= safe.total ? Color.orange : Color.accentColor)
     }
 
     private var controls: some View {
