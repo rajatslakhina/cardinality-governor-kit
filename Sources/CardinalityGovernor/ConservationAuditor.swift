@@ -29,6 +29,17 @@ public enum ConservationAuditor {
         /// More tallied than admitted — double counting, which inflates every rate.
         case inflated(admitted: Int, tallied: Int)
 
+        /// Observations admitted but never tallied into any series. Zero unless the
+        /// invariant is broken; negative is impossible, because double-counting is
+        /// `.inflated` rather than a negative shortfall.
+        public var shortfall: Int {
+            switch self {
+            case .conserved: return 0
+            case .leaked(let admitted, let tallied): return admitted.saturatingSubtracting(tallied)
+            case .inflated: return 0
+            }
+        }
+
         public var isConserved: Bool {
             if case .conserved = self { return true }
             return false
