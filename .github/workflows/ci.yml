@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux · Swift 6.0 · build + test
+    runs-on: ubuntu-latest
+    container: swift:6.0-jammy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: swift --version
+
+      # A fresh checkout has no `.build`, so this is a genuinely clean compile of every
+      # file. `-warnings-as-errors` is what makes "zero warnings" a machine-checked claim
+      # rather than a sentence in a README.
+      - name: Build (warnings are errors)
+        run: swift build -Xswiftc -warnings-as-errors
+
+      - name: Test
+        run: swift test
+
+  apple:
+    name: macOS 15 · build + test · compiles the SwiftUI module
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: swift --version
+
+      # The Linux job cannot compile `CardinalityGovernorUI` — `canImport(SwiftUI)` is
+      # false there, so the module builds empty. This job is the only place the SwiftUI
+      # surface is actually type-checked.
+      - name: Build (warnings are errors)
+        run: swift build -Xswiftc -warnings-as-errors
+
+      - name: Test
+        run: swift test
