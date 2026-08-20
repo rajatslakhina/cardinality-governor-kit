@@ -18,6 +18,16 @@ public enum ValueDisposition: Sendable, Equatable, CustomStringConvertible {
     case collapsedToOther
     /// The value was outside a closed domain, or was a forged reserved value.
     case collapsedToInvalid
+    /// The whole label set lost its identity to the joint series budget, so this key's
+    /// value — whatever its per-key fate would otherwise have been — is not in the
+    /// exported series.
+    ///
+    /// It replaces every other disposition on an overflowed result, including `.unset` and
+    /// `.collapsedToInvalid`, because `dispositions` describes what was *exported* and
+    /// under overflow nothing per-key was. The per-key lifetime counters
+    /// (`KeyStatistics.collapsedToInvalid` and friends) are unaffected and still describe
+    /// the value itself; the two answer different questions on purpose.
+    case collapsedToOverflow
 
     public var description: String {
         switch self {
@@ -25,6 +35,7 @@ public enum ValueDisposition: Sendable, Equatable, CustomStringConvertible {
         case .unset: return "unset"
         case .collapsedToOther: return "→ __other__"
         case .collapsedToInvalid: return "→ __invalid__"
+        case .collapsedToOverflow: return "→ __overflow__"
         }
     }
 }
@@ -62,7 +73,7 @@ public struct KeyStatistics: Sendable, Equatable {
     /// reporting it as `0%` reads as "healthy" for a key that was never exercised.
     public var collapseRate: Double? {
         guard observations > 0 else { return nil }
-        return Double(collapsedToOther + collapsedToInvalid) / Double(observations)
+        return Double(collapsedToOther.saturatingAdding(collapsedToInvalid)) / Double(observations)
     }
 
     public static func == (lhs: KeyStatistics, rhs: KeyStatistics) -> Bool {
@@ -100,7 +111,7 @@ public struct GovernorSnapshot: Sendable {
     /// What the joint space *could* reach given the current per-key allocations. Almost
     /// always far larger than `jointSeriesBudget`, which is the entire reason the joint
     /// budget exists as a separate mechanism.
-    public var jointSpaceUpperBound: Int
+    public let jointSpaceUpperBound: Int
 }
 
 public struct WindowReport: Sendable, Equatable {
@@ -150,8 +161,23 @@ public struct CardinalityGovernor: Sendable {
         // configuration mistake into a division or an allocation bug three layers down.
         /// Total distinct values apportioned across all open keys.
         public let distinctValueBudget: Int
-        /// Hard cap on distinct label sets tracked, `__overflow__` included. Bounds the
-        /// joint space.
+        /// Hard cap on distinct label sets tracked, `__overflow__` included — the bound on
+        /// the joint space, **for the lifetime of this governor** rather than per window.
+        ///
+        /// This is deliberate and it is the one place where the module's time semantics are
+        /// asymmetric, so it is worth being explicit rather than leaving it to be
+        /// discovered. Per-key budgets are windowed: a dimension value that stops appearing
+        /// releases its slot, because the question there is "what is worth attributing
+        /// *now*". The joint cap is not, because the question there is different — a
+        /// backend bills for every distinct series it has ever had to store, and a series
+        /// that stops receiving observations does not stop existing or stop costing money.
+        /// A windowed joint cap would let an app cycle through unlimited series over time
+        /// while reporting that it never exceeded its budget.
+        ///
+        /// The practical consequence: once `jointSeriesBudget - 1` real series have been
+        /// materialised, every genuinely new combination collapses to `__overflow__` for
+        /// the rest of the process. Pinned by
+        /// `testTheJointCapIsALifetimeCapNotAWindowedOne`.
         ///
         /// Clamped to at least 1, and that is not a rounding convenience. Conservation
         /// requires every observation to land in *some* series, so there must always be at
@@ -197,6 +223,9 @@ public struct CardinalityGovernor: Sendable {
 
     private var sketches: [DimensionKey: SpaceSavingSketch]
     private var estimators: [DimensionKey: HyperLogLog]
+    /// Last window's distinct-value estimate per open key. Kept so demand can be a
+    /// two-window maximum rather than a lifetime accumulation — see `rollWindow()`.
+    private var previousWindowDemand: [DimensionKey: Int]
     private var survivors: [DimensionKey: SurvivorSet]
 
     private var observations: [DimensionKey: Int]
@@ -262,6 +291,7 @@ public struct CardinalityGovernor: Sendable {
             survivors[key] = SurvivorSet(capacity: slots, graceWindows: configuration.promotionGraceWindows)
         }
 
+        self.previousWindowDemand = [:]
         self.observations = [:]
         self.collapsedToOther = [:]
         self.collapsedToInvalid = [:]
@@ -358,7 +388,9 @@ public struct CardinalityGovernor: Sendable {
         // series, the *next* observation overflows, and materialising `__overflow__` to
         // receive it pushes the tally to `budget + 1` — the enforcement mechanism breaking
         // the limit it exists to enforce. Found by
-        // `testJointBudgetCapsSeriesEvenWhenEveryKeyIsWithinItsOwnBudget`.
+        // `testJointCapHoldsExactlyAtEveryBudgetIncludingTheBoundary`, which asserts the
+        // bound after *every* observation at *every* budget from 1 to 12 rather than
+        // asserting "roughly bounded" once.
         var overflowed = false
         if seriesCounts[governed] == nil {
             let realSeriesCapacity = configuration.jointSeriesBudget - 1
@@ -368,6 +400,14 @@ public struct CardinalityGovernor: Sendable {
                 governed = overflowLabels
                 overflowed = true
                 jointOverflowObservations = jointOverflowObservations.saturatingAdding(1)
+                // Every disposition has to be rewritten, not just the label set. Leaving
+                // them as `.kept` while `labels` reads `__overflow__` makes the result
+                // self-contradictory, and any "how many values kept their identity"
+                // counter built on `dispositions` is then wrong by exactly the overflow
+                // volume. Asserted by `testOverflowDispositionsAgreeWithLabels`.
+                for key in dispositions.keys {
+                    dispositions[key] = .collapsedToOverflow
+                }
             }
         }
 
@@ -397,8 +437,18 @@ public struct CardinalityGovernor: Sendable {
         // Demand is the *upper* end of HyperLogLog's interval: under-allocating a key
         // costs attribution that cannot be recovered later, while over-allocating costs
         // slots that the joint budget caps anyway.
+        // Demand is the max over the current window and the previous one. A raw lifetime
+        // estimator is a monotone ratchet: HyperLogLog has no eviction, so a key that saw
+        // one burst of 100k distinct values at hour 1 still demands 100k at hour 12 and
+        // permanently starves every other key. `SpaceSavingSketch.decay()` already gives
+        // the heavy-hitter side windowed semantics; leaving the demand side unwindowed
+        // means the two sketches feeding one allocator disagree about what time is.
+        //
+        // Two windows rather than one, because a single quiet window should not crater a
+        // key's allocation and force its survivors to re-earn their slots.
         let demands = openKeys.reduce(into: [DimensionKey: Int]()) { result, key in
-            result[key] = estimators[key]?.estimateInterval.upperBound ?? 0
+            let thisWindow = estimators[key]?.estimateInterval.upperBound ?? 0
+            result[key] = max(thisWindow, previousWindowDemand[key] ?? 0)
         }
 
         allocation = BudgetAllocator.allocate(
@@ -410,12 +460,28 @@ public struct CardinalityGovernor: Sendable {
         var reconciliations: [DimensionKey: SurvivorSet.Reconciliation] = [:]
         for key in openKeys {
             let slots = allocation.allocation(for: key)
+            // Above the guard on purpose. The guard is currently unreachable, but the
+            // entire windowed-demand mechanism must not be gated behind a check about two
+            // unrelated dictionaries — a refactor that let it fire would silently restore
+            // the lifetime ratchet with no test failing.
+            previousWindowDemand[key] = estimators[key]?.estimateInterval.upperBound ?? 0
+            estimators[key] = HyperLogLog(precision: configuration.hyperLogLogPrecision)
+
             guard var sketch = sketches[key], var survivorSet = survivors[key] else { continue }
 
             let candidates = sketch.ranked(limit: slots.saturatingMultiplied(by: configuration.sketchOverprovision))
             reconciliations[key] = survivorSet.reconcile(candidates: candidates, newCapacity: slots)
 
             sketch.decay()
+            // The sketch has to follow the allocation. Sizing it once at construction and
+            // never again caps the effective per-key budget at
+            // `min(allocation, initialAllocation × overprovision)` — so a key whose
+            // allocation grows can never fill its new slots from `ranked(limit:)`, its
+            // extra survivors go unobserved, expire, and get refilled by *arrival order*
+            // on the admission path. That is precisely the pathology this whole module
+            // exists to avoid, reintroduced one layer down. Asserted by
+            // `testSurvivorsAreChosenByFrequencyEvenAfterAKeysAllocationGrows`.
+            sketch.resize(capacity: slots.saturatingMultiplied(by: configuration.sketchOverprovision))
             sketches[key] = sketch
             survivors[key] = survivorSet
         }
@@ -435,17 +501,37 @@ public struct CardinalityGovernor: Sendable {
 
     // MARK: Inspection
 
+    /// The values of `key` that currently keep their own identity, sorted.
+    ///
+    /// Exposed because "which values survived" is the question a team actually asks when a
+    /// dashboard goes strange, and because a survivor set that churns under a stationary
+    /// input is a bug you cannot see from the counts alone.
+    public func survivingValues(for key: DimensionKey) -> [String] {
+        (survivors[key]?.members.keys).map { $0.sorted() } ?? []
+    }
+
     public var snapshot: GovernorSnapshot {
         let keyStats: [KeyStatistics] = schema.declaredKeys.map { key in
             let isOpen = schema.openKeys.contains(key)
             let estimator = estimators[key]
+            // The estimator is reset at every window boundary, so reading it directly
+            // renders `0 ±0` for every open dimension in any snapshot taken immediately
+            // after a roll — which is exactly when a dashboard re-reads. Report the same
+            // two-window maximum the allocator uses, so the number on screen is the number
+            // the budget was computed from.
+            let carried = previousWindowDemand[key] ?? 0
+            let liveInterval = estimator?.estimateInterval
+            let reportedInterval: (lowerBound: Int, upperBound: Int)? = liveInterval.map {
+                (max($0.lowerBound, carried), max($0.upperBound, carried))
+            }
             return KeyStatistics(
                 key: key,
                 isOpen: isOpen,
                 allocation: isOpen ? allocation.allocation(for: key) : closedDomainSize(key),
                 survivors: survivors[key]?.count ?? closedDomainSize(key),
-                estimatedDistinctValues: estimator?.estimatedCardinality ?? closedDomainSize(key),
-                estimatedDistinctInterval: estimator?.estimateInterval
+                estimatedDistinctValues: estimator.map { max($0.estimatedCardinality, carried) }
+                    ?? closedDomainSize(key),
+                estimatedDistinctInterval: reportedInterval
                     ?? (closedDomainSize(key), closedDomainSize(key)),
                 observations: observations[key] ?? 0,
                 collapsedToOther: collapsedToOther[key] ?? 0,
