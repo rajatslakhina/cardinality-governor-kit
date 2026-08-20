@@ -70,11 +70,20 @@ public final class GovernorDashboardModel {
 
         let first = scenarios.first
         self.selectedID = first?.id ?? ""
-        self.governor = CardinalityGovernor(
+
+        // Built into a local and assigned from there, rather than `self.snapshot =
+        // governor.snapshot`. Under `@Observable` every stored property becomes a computed
+        // accessor over macro-generated storage, so reading `governor` back through `self`
+        // is a property *access* — illegal until every stored property is initialised.
+        // Linux cannot catch this: `canImport(SwiftUI)` is false there and this whole file
+        // compiles to an empty module. The macOS CI job caught it on the first run.
+        let initialGovernor = CardinalityGovernor(
             schema: first?.schema ?? DimensionSchema(),
             configuration: first?.configuration ?? .default
         )
-        self.snapshot = governor.snapshot
+        self.governor = initialGovernor
+        self.lastWindow = nil
+        self.snapshot = initialGovernor.snapshot
 
         // Warm up so the dashboard is populated the instant it appears. An empty
         // dashboard on launch reads as a broken demo, and the interesting behaviour —
@@ -398,7 +407,7 @@ public struct GovernorDashboardView: View {
             .buttonStyle(.bordered)
         }
         .padding(.horizontal)
-        .padding( .vertical, 10)
+        .padding(.vertical, 10)
         .background(.bar)
     }
 }
