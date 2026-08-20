@@ -31,6 +31,23 @@ jobs:
       - name: Test
         run: swift test
 
+      # `GovernorService` is reentrancy-free because no method body contains an `await`:
+      # every body is one synchronous mutation, so there is no suspension point at which
+      # another task could observe half-updated state. Adding a single `await` inside
+      # `admit` would destroy that with no compiler diagnostic — the property is
+      # load-bearing and structurally unenforceable in the language. So it is enforced
+      # here instead, which converts the repo's strongest concurrency claim from prose
+      # into a machine check.
+      - name: The actor must contain no suspension points
+        run: |
+          # Comment lines stripped first — the doc comment at the top of the file
+          # explains the rule and necessarily contains the word.
+          if grep -vE '^[[:space:]]*//' Sources/CardinalityGovernor/GovernorService.swift | grep -n 'await'; then
+            echo "::error file=Sources/CardinalityGovernor/GovernorService.swift::GovernorService must contain no 'await' — see the reentrancy note at the top of the file."
+            exit 1
+          fi
+          echo "OK: no suspension points in GovernorService."
+
   apple:
     name: macOS 15 · build + test · compiles the SwiftUI module
     runs-on: macos-15
