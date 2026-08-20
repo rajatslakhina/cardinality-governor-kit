@@ -27,11 +27,23 @@ public struct SurvivorSet: Sendable, Equatable {
 
     /// Survivor value -> consecutive windows in which it was not observed.
     public private(set) var members: [String: Int]
+    /// Survivors actually seen on the admission path since the last reconciliation.
+    ///
+    /// This exists because the obvious alternative is wrong in both directions. Deriving
+    /// "was it observed?" from the sketch's ranked candidate list — which is what this
+    /// type did originally — means (a) a survivor that has genuinely stopped appearing is
+    /// still listed by a sketch under no pressure, because `decay()` floors counts at 1
+    /// and never removes a counter, so it never expires and `expired` is dead in practice;
+    /// and (b) a value observed thousands of times but evicted from the sketch under
+    /// pressure accrues misses and is expired *while live*. The grace window is a claim
+    /// about the value, not about the sketch's opinion of the value.
+    private var observedThisWindow: Set<String>
     public private(set) var capacity: Int
     public let graceWindows: Int
 
     public init(capacity: Int, graceWindows: Int = 2) {
         self.members = [:]
+        self.observedThisWindow = []
         self.capacity = max(0, capacity)
         self.graceWindows = max(0, graceWindows)
     }
@@ -49,17 +61,23 @@ public struct SurvivorSet: Sendable, Equatable {
     mutating func admitIfSlotAvailable(_ value: String) -> Bool {
         guard !ReservedValue.isReserved(value) else { return false }
         if members[value] != nil {
-            members[value] = 0
+            observedThisWindow.insert(value)
             return true
         }
         guard members.count < capacity else { return false }
         members[value] = 0
+        observedThisWindow.insert(value)
         return true
     }
 
-    /// Records that a survivor was seen this window, resetting its grace counter.
+    /// Records that a survivor was seen this window.
+    ///
+    /// The write lands in `observedThisWindow` rather than in `members`, because
+    /// `reconcile` rewrites every `members` value in step 1 — a `touch` that wrote there
+    /// would be unconditionally overwritten before anything read it, making this method
+    /// dead code on the hot admission path.
     mutating func touch(_ value: String) {
-        if members[value] != nil { members[value] = 0 }
+        if members[value] != nil { observedThisWindow.insert(value) }
     }
 
     public struct Reconciliation: Sendable, Equatable {
@@ -89,7 +107,8 @@ public struct SurvivorSet: Sendable, Equatable {
         var report = Reconciliation()
         capacity = max(0, newCapacity)
 
-        let observed = Set(candidates.map(\.value))
+        // Live observation, not sketch membership. See `observedThisWindow`.
+        let observed = observedThisWindow
         var bounds: [String: (lowerBound: Int, upperBound: Int)] = [:]
         for candidate in candidates {
             bounds[candidate.value] = (candidate.lowerBound, candidate.upperBound)
@@ -135,9 +154,23 @@ public struct SurvivorSet: Sendable, Equatable {
         // 4. Contest the remaining challengers against the weakest incumbent. Bounded by
         //    the number of challengers — each iteration consumes exactly one, so this
         //    cannot spin even if every comparison succeeds.
+        // An incumbent that was observed this window but is absent from the ranked
+        // candidates has *unknown* strength, not zero strength — the sketch evicted it
+        // under pressure, which is a statement about the sketch's capacity, not about the
+        // value. Contesting it would be the maximal case of the thing the separation rule
+        // exists to prevent: a swap decided by no evidence at all. So it is not a contest
+        // target while any ranked incumbent exists.
+        //
+        // Held as an exclusion set rather than a snapshot of the contestable members,
+        // because members change under the loop: each swap removes an incumbent and adds
+        // the challenger, and a precomputed membership list goes stale on the first swap.
+        let unranked = observed.subtracting(bounds.keys)
         for challenger in challengers {
             guard capacity > 0 else { break }
-            guard let weakest = weakestIncumbent(bounds: bounds) else { break }
+            guard let weakest = weakestIncumbent(bounds: bounds, excluding: unranked) else {
+                report.refusedForInsufficientSeparation.append(challenger.value)
+                continue
+            }
             let incumbentUpper = bounds[weakest]?.upperBound ?? -1
             // Strict separation beyond the sketch's error interval, or no swap.
             guard challenger.lowerBound > incumbentUpper else {
@@ -150,6 +183,9 @@ public struct SurvivorSet: Sendable, Equatable {
             report.promoted.append(challenger.value)
         }
 
+        // The window is over: everything observed during it has now been accounted for.
+        observedThisWindow.removeAll(keepingCapacity: true)
+
         report.promoted.sort()
         report.demoted.sort()
         report.expired.sort()
@@ -157,8 +193,11 @@ public struct SurvivorSet: Sendable, Equatable {
         return report
     }
 
-    private func weakestIncumbent(bounds: [String: (lowerBound: Int, upperBound: Int)]) -> String? {
-        members.keys.min { lhs, rhs in
+    private func weakestIncumbent(
+        bounds: [String: (lowerBound: Int, upperBound: Int)],
+        excluding unranked: Set<String>
+    ) -> String? {
+        members.keys.lazy.filter { !unranked.contains($0) }.min { lhs, rhs in
             let lhsUpper = bounds[lhs]?.upperBound ?? -1
             let rhsUpper = bounds[rhs]?.upperBound ?? -1
             return lhsUpper == rhsUpper ? lhs < rhs : lhsUpper < rhsUpper
