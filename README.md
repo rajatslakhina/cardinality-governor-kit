@@ -2,7 +2,7 @@
 
 **Four dimensions budgeted at eight values each is thirty-two values — and four thousand and ninety-six series. Teams reason about the first number and pay for the second.**
 
-iOS 27 rebuilt MetricKit. `MetricManager` replaces the delegate-based `MXMetricManager`, reports arrive as `Codable` async sequences, and — the part that changes your bill — `StateReporting` lets you tag app states so launch time, hangs and memory break down by user flow, configuration or experiment instead of a blended app-wide average.
+iOS 27 rebuilt MetricKit (see Apple's MetricKit documentation for the current `MetricManager` and `StateReporting` surface). `MetricManager` replaces the delegate-based `MXMetricManager`, reports arrive as `Codable` async sequences, and — the part that changes your bill — `StateReporting` lets you tag app states so launch time, hangs and memory break down by user flow, configuration or experiment instead of a blended app-wide average.
 
 That is a genuinely good API. It also hands every iOS team a problem that backend teams have been paying for since Prometheus shipped: **the moment you can attach dimensions to a metric, the series space becomes the product of the dimension domains, and nothing in the SDK stops you from multiplying.**
 
@@ -184,11 +184,28 @@ It consumes this package as a **version-pinned remote Swift Package dependency**
 **What was actually run, and what was not.**
 
 - ✅ `swift build -Xswiftc -warnings-as-errors` on a **clean tree** (`.build` removed first — an incremental build compiles nothing and still prints "Build complete!", which is evidence of nothing). Zero warnings, zero errors.
-- ✅ `swift test` — **94 XCTest cases across 9 suites**, all passing. Toolchain: Swift 6.0.3, Linux aarch64.
+- ✅ `swift test` — **107 XCTest cases across 10 suites**, all passing. Toolchain: Swift 6.0.3, Linux aarch64.
 - ✅ Both are re-run in CI on every push, and **both jobs are green**: a Linux job (`swift:6.0-jammy` container) and a macOS 15 job, each running the same clean warnings-as-errors build and the same suite. Live results: **[Actions](https://github.com/rajatslakhina/cardinality-governor-kit/actions)**.
 - ❌ **This library was not run on a Simulator by the pipeline that produced it.** Simulator access was refused, verbatim: *"Computer-use access to 'Simulator' can't be approved during a scheduled run."* The companion demo repo states the same thing in its own words. Compiling for a Simulator and running on a Simulator are two different claims and neither repo conflates them.
 
 > **The macOS job earned its keep on the very first run.** `canImport(SwiftUI)` is false on Linux, so `CardinalityGovernorUI` compiles to an *empty module* there and the Linux job went green over code it had never type-checked. macOS failed the same commit with one real error: `'self' used in property access 'governor' before all stored properties are initialized`. Under `@Observable` every stored property becomes a computed accessor over macro-generated storage, so `self.snapshot = governor.snapshot` in `init` is a property *access*, not a field read — illegal until initialisation completes. Fixed by assigning through a local; the comment explaining it is still in `GovernorDashboard.swift` because the next person to "simplify" that initialiser needs to know. This is the whole argument for the second job: a single-platform CI on a package with `#if canImport` seams is a green tick over unread code.
+
+### What an independent review found
+
+Both repos were put through an adversarial review before publication, and it was worth doing. Four real defects came out of the first round, all now fixed and all covered by tests that were confirmed to fail without the fix:
+
+- **`jointSpaceUpperBound` was not an upper bound.** It counted `__invalid__` for closed keys but not `__unset__`, and `__other__`/`__unset__` for open keys but not `__invalid__` — which an open key does produce, because the forged-sentinel check runs before the domain switch. A type named `…UpperBound` that undercounts is worse than no type.
+- **`AdmissionResult` contradicted itself on joint overflow.** `dispositions` was finalised in the per-key loop; the overflow branch then replaced `labels` wholesale and never revisited it, so a caller could read `.kept` for a key whose label said `__overflow__`. Any "how many values kept their identity" counter built on it was wrong by exactly the overflow volume.
+- **The heavy-hitter sketch never followed the allocation.** Sized once at construction and never resized, it capped the effective per-key budget — and the slots it could no longer nominate for were filled by *arrival order* on the admission path. The module's headline design decision, defeated one layer down.
+- **Demand was a lifetime ratchet.** `SpaceSavingSketch.decay()` gave the heavy-hitter side windowed semantics, but HyperLogLog has no eviction and its estimate fed the allocator raw, so a key that saw one burst of distinct values held those slots forever. Two sketches feeding one allocator, disagreeing about what time is.
+
+The last two share a cause worth naming: no test exercised a *changing* allocation, so both survived a suite that was otherwise fairly aggressive. The prose describing this system was more careful than the code that ran it, and only a test that varies the thing the prose is about could have caught that.
+
+A second review round then found a fifth, and a better one:
+
+- **The grace period measured the wrong thing.** `SurvivorSet` derived "was this value observed?" from the sketch's ranked candidate list rather than from live observation, which is wrong in *both* directions. A value that genuinely stopped arriving never expired, because `decay()` floors counts at 1 and never removes a counter, so a sketch under no pressure lists it forever — which made `Reconciliation.expired` dead in integrated use and the dashboard's "expired" row permanently zero. And a value observed thousands of times but evicted from the sketch under pressure accrued misses and expired *while live*. `touch(_:)` was consequently dead code: its only write was unconditionally overwritten before anything read it. Observation is now tracked explicitly, and two tests pin the two directions separately.
+
+That one is the most interesting of the five, because nothing about it looked wrong. `expired` was populated in unit tests — just never in integration — and the prose describing the grace period was accurate about the *intent*.
 
 ### On the tests
 
@@ -198,7 +215,9 @@ The suite is written against a specific failure mode: tests that would still pas
 - Determinism is checked across **independently constructed instances** or **opposite insertion orders**, never by calling the same function twice in one process.
 - `testRepeatedObservationsOfOneValueEstimateOne` feeds 10,000 copies of one hash to HyperLogLog. An implementation that counted observations rather than distinct values passes every accuracy test and fails only here.
 - The concurrency test runs **eight concurrent writers**, not one awaited task.
-- Every trap site named in the source has a test that hits it: `Int(Double.nan)`, `Int(.infinity)`, `Int.min / -1`, `x % 0`, `Int.max + 1`, `heap[0]` on an empty heap, `ProgressView` with a zero total.
+- **Non-vacuity is verified by mutation, not by inspection.** Three behaviours were checked by reverting the fix and confirming the specific test fails: the sketch resize (`testSurvivorsAreChosenByFrequencyEvenAfterAKeysAllocationGrows`), the windowed demand estimate (`testAKeyThatStopsBeingDiverseGivesItsSlotsBack`), and the overflow dispositions (`testOverflowDispositionsAgreeWithLabels`). The first did *not* fail on the first attempt — it asserted the survivor set fills its allocation, which is true under the bug too, because free slots are handed out live on the admission path. It now asserts survivors are the top-k by *frequency*, against an input where arrival order is deliberately anti-correlated with frequency. A test you have not watched fail is a test you have not written.
+- The fourth test in that file, `testASingleQuietWindowDoesNotStripAKey`, is **not** a mutation test and is not claimed as one: a lifetime estimator passes it too. It guards the opposite error — a reset that strips a key on its first quiet window — and it is called out separately rather than folded into the count, because "four tests, mutation-checked" would have been one test too many.
+- Every trap site named in the source has a test that hits it: `Int(Double.nan)`, `Int(.infinity)`, `Int.min / -1`, `x % 0`, `Int.max + 1`, `count - error` at `Int.min`, `Int.min.saturatingSubtracting(1)`, `heap[0]` on an empty heap, and `ProgressView` with a zero, negative, NaN or infinite total — the last of these via `SafeProgress`, which lives in the core module precisely so the guard has a test that runs on every platform in CI rather than only the ones with SwiftUI.
 
 ---
 
